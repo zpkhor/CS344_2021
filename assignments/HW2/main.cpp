@@ -122,6 +122,7 @@ int main(int argc, char **argv) {
   checkCudaErrors(cudaFree(d_blueBlurred));
 
   cleanUp();
+  cudaDeviceReset();
 
   return 0;
 }
