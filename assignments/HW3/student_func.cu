@@ -80,19 +80,245 @@
 */
 
 #include "utils.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+#define BLOCK_SIZE 1024
+
+unsigned int **d_histo_arr = nullptr;
+
+__global__ void local_histo(const float *const lum,
+                           unsigned int **const d_histo_arr,
+                           float lumMin,
+                           float lumRange,
+                           const size_t n_elements,
+                           const size_t numBins) {
+   extern __shared__ unsigned int histo[];
+   unsigned int arr_i = blockIdx.x;
+   unsigned int global_i = arr_i * 16;
+   // Init histo
+   for (int j = 0; j < numBins; j++) {
+      histo[j] = 0;
+   }
+
+   unsigned int *cur_arr = d_histo_arr[arr_i];
+   unsigned int bound = 16 + global_i;
+   unsigned int max_bin = numBins - 1;
+   while (global_i < n_elements && global_i < bound) {
+      unsigned int bin = (unsigned int) ((lum[global_i] - lumMin) / lumRange * numBins);
+      if (bin > max_bin) {
+         bin = max_bin;
+      }
+      histo[bin]++;
+      global_i++;
+   }
+
+   for (int k = 0; k < numBins; k++) {
+      cur_arr[k] = histo[k];
+   }
+}
+
+__global__ void reduce_kernel(unsigned int **d_histo_arr_out, unsigned int **d_histo_arr_in, const int num_arr, const int numBins)
+{
+   unsigned int myId = threadIdx.x + blockDim.x * blockIdx.x;
+   int tid  = threadIdx.x;
+
+   // do reduction in global mem
+   for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+   {
+      if (tid < s && myId < num_arr && (myId + s) < num_arr)
+      {
+         unsigned int *d_histo_in = d_histo_arr_in[myId];
+         unsigned int *d_histo_in_s = d_histo_arr_in[myId + s];
+         for (int i=0; i<numBins;++i) {
+            d_histo_in[i] += d_histo_in_s[i];
+         }
+      }
+      __syncthreads();        // make sure all adds at one stage are done!
+   }
+
+   // only thread 0 writes result for this block back to global mem
+   if (tid == 0 && myId < num_arr)
+   {
+      unsigned int *d_histo_out = d_histo_arr_out[blockIdx.x];
+      unsigned int *d_histo_reduced = d_histo_arr_in[myId];
+      for (int i=0; i<numBins;++i) {
+         d_histo_out[i] = d_histo_reduced[i];
+      }
+   }
+}
+
+__global__ void exclusive_scan(unsigned int *const d_cdf, unsigned int *d_reduced_histo) {
+   int idx = threadIdx.x;
+   if (idx > 0) {
+      d_cdf[idx] = d_reduced_histo[idx - 1];
+   } else {
+      d_cdf[0] = 0;
+   }
+   __syncthreads();
+
+   for (int s = 1; s < blockDim.x; s<<=1) {
+      if ((idx - s) >= 0) {
+         d_cdf[idx] += d_cdf[idx -s];
+      }
+      __syncthreads();
+   }
+}
+
+int roundUpToPowerOf2(int v) {
+    v--; // Ensure that v is not already a power of 2
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    v++; // Increment to get the next power of 2
+    return v;
+}
+
+__global__ void minReduce(const float* const input, int size, float* result) {
+    extern __shared__ float sdata[];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load input into shared memory
+    sdata[tid] = (i < size) ? input[i] : 0xFFFFFF;
+    __syncthreads();
+
+    // Perform parallel reduction
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = min(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Store result in global memory
+    if (tid == 0) {
+        result[blockIdx.x] = sdata[0];
+    }
+}
+
+__global__ void maxReduce(const float* const input, int size, float* result) {
+    extern __shared__ float sdata[];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load input into shared memory
+    sdata[tid] = (i < size) ? input[i] : -0xFFFFFF;
+    __syncthreads();
+
+    // Perform parallel reduction
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = max(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Store result in global memory
+    if (tid == 0) {
+        result[blockIdx.x] = sdata[0];
+    }
+}
+
+void cleanup(int num_arr, int** h_histo_arr) {
+  for (int i=0; i<num_arr; i++) {
+   checkCudaErrors(cudaFree(h_histo_arr[i]));
+  }
+  checkCudaErrors(cudaFree(d_histo_arr));
+}
 
 void your_histogram_and_prefixsum(const float *const d_logLuminance,
                                   unsigned int *const d_cdf, float &min_logLum,
                                   float &max_logLum, const size_t numRows,
                                   const size_t numCols, const size_t numBins) {
   // TODO
-  /*Here are the steps you need to implement
-    1) find the minimum and maximum value in the input logLuminance channel
-       store in min_logLum and max_logLum
-    2) subtract them to find the range
-    3) generate a histogram of all the values in the logLuminance channel using
-       the formula: bin = (lum[i] - lumMin) / lumRange * numBins
-    4) Perform an exclusive scan (prefix sum) on the histogram to get
-       the cumulative distribution of luminance values (this should go in the
-       incoming d_cdf pointer which already has been allocated for you)       */
+// Here are the steps you need to implement
+   // 1) find the minimum and maximum value in the input logLuminance channel
+   //    store in min_logLum and max_logLum
+   unsigned int n_elements = numRows * numCols;
+   const int blocksPerGrid = roundUpToPowerOf2((n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE);
+   float *d_logLum, *d_logLum_imt;
+   cudaMalloc((void **) &d_logLum_imt, blocksPerGrid * sizeof(float));
+   cudaMalloc((void **) &d_logLum, sizeof(float));
+   // max
+   maxReduce<<<blocksPerGrid, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(d_logLuminance, n_elements, d_logLum_imt);
+   checkCudaErrors(cudaDeviceSynchronize());
+   maxReduce<<<1, blocksPerGrid, blocksPerGrid * sizeof(float)>>>(d_logLum_imt, blocksPerGrid, d_logLum);
+   checkCudaErrors(cudaDeviceSynchronize());
+   cudaMemcpy(&max_logLum, d_logLum, sizeof(float), cudaMemcpyDeviceToHost);
+   // min
+   minReduce<<<blocksPerGrid, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(d_logLuminance, n_elements, d_logLum_imt);
+   checkCudaErrors(cudaDeviceSynchronize());
+   minReduce<<<1, blocksPerGrid, blocksPerGrid * sizeof(float)>>>(d_logLum_imt, blocksPerGrid, d_logLum);
+   checkCudaErrors(cudaDeviceSynchronize());
+   cudaMemcpy(&min_logLum, d_logLum, sizeof(float), cudaMemcpyDeviceToHost);
+   cudaFree(d_logLum);
+   cudaFree(d_logLum_imt);
+   
+   // 2) subtract them to find the range
+   float lumRange = max_logLum - min_logLum;
+
+   // 3) generate a histogram of all the values in the logLuminance channel using
+   const dim3 blockSize(1);
+   const dim3 gridSize((n_elements + 15) / 16);
+   int num_arr = roundUpToPowerOf2(gridSize.x * gridSize.y);
+   checkCudaErrors(cudaMalloc((void **) &d_histo_arr, num_arr * sizeof(unsigned int *)));
+   int **h_histo_arr = (int**) malloc(num_arr * sizeof(int *));
+   for (int i=0; i<num_arr; ++i) {
+      checkCudaErrors(cudaMalloc(&h_histo_arr[i], numBins * sizeof(int)));
+   }
+   checkCudaErrors(cudaMemcpy(d_histo_arr, h_histo_arr, num_arr * sizeof(unsigned int*), cudaMemcpyHostToDevice));
+   local_histo<<<gridSize, blockSize, numBins * sizeof(int)>>>(d_logLuminance, d_histo_arr, min_logLum, lumRange, n_elements, numBins);
+   checkCudaErrors(cudaDeviceSynchronize());
+
+   // reduce
+   unsigned int **d_reduced_intermediate_histo = nullptr;
+   unsigned int **h_intermediate = (unsigned int**) malloc(num_arr * sizeof(unsigned int *));
+   for (int i=0; i<num_arr; ++i) {
+      checkCudaErrors(cudaMalloc(&h_intermediate[i], numBins * sizeof(unsigned int)));
+   }
+   checkCudaErrors(cudaMalloc((void **) &d_reduced_intermediate_histo, num_arr * sizeof(unsigned int *)));
+   checkCudaErrors(cudaMemcpy(d_reduced_intermediate_histo, h_intermediate, num_arr * sizeof(unsigned int*), cudaMemcpyHostToDevice));
+
+   int n_blocks = (num_arr + 1023) / BLOCK_SIZE;
+   reduce_kernel<<<n_blocks, BLOCK_SIZE>>>(d_reduced_intermediate_histo, d_histo_arr, num_arr, numBins);
+   checkCudaErrors(cudaDeviceSynchronize());
+
+   int n_threads = n_blocks;
+   n_blocks = 1;
+   unsigned int **d_reduced_histo = nullptr;
+   unsigned int **h_reduced = (unsigned int**) malloc(1 * sizeof(unsigned int *));
+   checkCudaErrors(cudaMalloc((void **) &d_reduced_histo, sizeof(unsigned int *)));
+   checkCudaErrors(cudaMalloc(&h_reduced[0], numBins * sizeof(unsigned int)));
+   cudaMemcpy(d_reduced_histo, h_reduced, 1 * sizeof(unsigned int*), cudaMemcpyHostToDevice);
+   reduce_kernel<<<n_blocks, n_threads>>>(d_reduced_histo, d_reduced_intermediate_histo, n_threads, numBins);
+   checkCudaErrors(cudaDeviceSynchronize());
+
+   // 4) Perform an exclusive scan (prefix sum) on the histogram to get
+   //    the cumulative distribution of luminance values (this should go in the
+   //    incoming d_cdf pointer which already has been allocated for you)
+
+   exclusive_scan<<<1, numBins>>>(d_cdf, *h_reduced);
+   checkCudaErrors(cudaDeviceSynchronize());
+   cleanup(num_arr, h_histo_arr);
+   free(h_histo_arr);
 }
+
+/* Lesson learned 2024.01.01, took me 3 days 2 nights
+1. Always checkCudaError after kernel call, malloc, memcopy
+2. Array of pointers allocation need to be done on host first, then copy to ** on device,
+ as the array of pointers point to device memory:
+   unsigned int **d_reduced_intermediate_histo = nullptr;
+   unsigned int **h_intermediate = (unsigned int**) malloc(num_arr * sizeof(unsigned int *));
+   for (int i=0; i<num_arr; ++i) {
+      checkCudaErrors(cudaMalloc(&h_intermediate[i], numBins * sizeof(unsigned int)));
+   }
+   checkCudaErrors(cudaMalloc((void **) &d_reduced_intermediate_histo, num_arr * sizeof(unsigned int *)));
+   checkCudaErrors(cudaMemcpy(d_reduced_intermediate_histo, h_intermediate, num_arr * sizeof(unsigned int*), cudaMemcpyHostToDevice));
+3. Need to pad the input to the size of next round up of power of 2
+4. When casting to int, ensure bracket is placed entirely on the float calculation
+*/
